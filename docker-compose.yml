@@ -1,0 +1,33 @@
+services:
+  api:
+    build: ./backend
+    container_name: flac_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # Exponemos el backend directamente para probarlo
+    volumes:
+      - ${MUSIC_PATH}:/music:ro
+      - ./volumes/db:/app/db # Restablecemos el guardado de la base de datos
+    networks:
+      - internal_net
+    environment:
+      - MUSIC_DIR=/music
+      - DATABASE_URL=sqlite:////app/db/flac_metadata.db
+
+  proxy:
+    image: nginx:alpine
+    container_name: flac_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${MUSIC_PATH}:/music:ro # Nginx lee directo del Shanling/SD
+    networks:
+      - internal_net
+    depends_on:
+      - api
+
+networks:
+  internal_net:
+    driver: bridge
