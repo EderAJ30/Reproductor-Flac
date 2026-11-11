@@ -1,148 +1,92 @@
-from fastapi import FastAPI, BackgroundTasks, Response, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, Depends, Query, Response, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import threading
-import os
+import threading, os
 from mutagen.flac import FLAC
-from sqlalchemy import create_engine, Column, Integer, String, Float, or_, desc
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/db/flac_metadata.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class Track(Base):
-    __tablename__ = "tracks"
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, index=True)
-    title = Column(String, index=True)
-    artist = Column(String, index=True)
-    album = Column(String, index=True)
-    duration = Column(Float)
-    path = Column(String, unique=True)
-    file_size = Column(Float)
-    bit_depth = Column(Integer)
-    sample_rate = Column(Integer)
-    bitrate = Column(Integer)
-    added_at = Column(Float)
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, desc, func
+from .database import engine, Base, get_db
+from .models import Track
+from .scanner import scan_directory, MUSIC_DIR
 
 Base.metadata.create_all(bind=engine)
-MUSIC_DIR = os.getenv("MUSIC_DIR", "/music")
 
-def scan_directory_task():
-    print("Iniciando escaneo de directorio...", flush=True)
-    db = SessionLocal()
-    try:
-        contador = 0
-        for root, dirs, files in os.walk(MUSIC_DIR):
-            for file in files:
-                if file.lower().endswith(".flac") and not file.startswith("."):
-                    filepath = os.path.join(root, file)
-                    if not db.query(Track).filter(Track.path == filepath).first():
-                        try:
-                            audio = FLAC(filepath)
-                            track = Track(
-                                filename=file,
-                                title=audio.get("title", [file])[0],
-                                artist=audio.get("artist", ["Desconocido"])[0],
-                                album=audio.get("album", ["Desconocido"])[0],
-                                duration=audio.info.length if hasattr(audio, 'info') else 0.0,
-                                path=filepath,
-                                file_size=os.path.getsize(filepath),
-                                bit_depth=getattr(audio.info, 'bits_per_sample', 16),
-                                sample_rate=getattr(audio.info, 'sample_rate', 44100),
-                                bitrate=getattr(audio.info, 'bitrate', 0),
-                                added_at=os.path.getmtime(filepath)
-                            )
-                            db.add(track)
-                            db.commit() # AHORA GUARDAMOS CANCIÓN POR CANCIÓN
-                            contador += 1
-                            print(f"Indexado ({contador}): {file}", flush=True)
-                        except Exception as e:
-                            print(f"Error procesando {file}: {e}", flush=True)
-        print("Escaneo finalizado exitosamente.", flush=True)
-    finally:
-        db.close()
-
-# ESTO ES LO NUEVO: Arranca el escaneo automáticamente
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Se ejecuta al iniciar el contenedor
-    hilo_escaneo = threading.Thread(target=scan_directory_task)
-    hilo_escaneo.start()
+    threading.Thread(target=scan_directory).start()
     yield
-    # Se ejecuta al apagar el contenedor
-    print("Apagando API...")
 
 app = FastAPI(title="FLAC Player API", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.post("/api/scan")
-def start_scan(background_tasks: BackgroundTasks):
-    background_tasks.add_task(scan_directory_task)
-    return {"status": "ok", "message": "Escaneo iniciado desde el frontend."}
+def trigger_scan(background_tasks: BackgroundTasks):
+    background_tasks.add_task(scan_directory)
+    return {"status": "ok"}
+  
+@app.get("/api/status")
+def get_device_status():
+    try:
+        is_mounted = os.path.exists(MUSIC_DIR) and len(os.listdir(MUSIC_DIR)) > 0
+        return {"connected": is_mounted, "path": MUSIC_DIR}
+    except Exception:
+        return {"connected": False, "path": MUSIC_DIR}
+
+@app.get("/api/info")
+def get_library_info(db: Session = Depends(get_db)):
+    total = db.query(Track).count()
+    return {"library_path": MUSIC_DIR, "total_tracks": total}
 
 @app.get("/api/tracks")
 def get_tracks(
-    search: str = Query(None, description="Término de búsqueda"),
-    sort: str = Query("recent", description="recent, size_asc, size_desc"),
-    skip: int = 0, 
-    limit: int = 100
+    search: str = None, album: str = None, artist: str = None,
+    page: int = Query(1, ge=1), limit: int = Query(24, ge=1, le=100),
+    db: Session = Depends(get_db)
 ):
-    db = SessionLocal()
-    try:
-        query = db.query(Track)
-        if search:
-            query = query.filter(
-                or_(
-                    Track.title.ilike(f"%{search}%"),
-                    Track.artist.ilike(f"%{search}%"),
-                    Track.album.ilike(f"%{search}%")
-                )
-            )
-        if sort == "size_desc":
-            query = query.order_by(desc(Track.file_size))
-        elif sort == "size_asc":
-            query = query.order_by(Track.file_size)
-        else: 
-            query = query.order_by(desc(Track.added_at))
-            
-        tracks = query.offset(skip).limit(limit).all()
-        total = query.count()
-        return {"total_indexados": total, "tracks": tracks}
-    finally:
-        db.close()
+    query = db.query(Track)
+    if search: 
+        query = query.filter(or_(Track.title.ilike(f"%{search}%"), Track.artist.ilike(f"%{search}%"), Track.album.ilike(f"%{search}%")))
+    
+    if artist: query = query.filter(Track.artist == artist)
+        
+    if album: 
+        query = query.filter(Track.album == album)
+        # ORDENAMOS POR EL NÚMERO REAL DEL DISCO
+        query = query.order_by(Track.track_number.asc())
+    else:
+        query = query.order_by(desc(Track.added_at))
+    
+    total = query.count()
+    total_pages = (total + limit - 1) // limit
+    tracks = query.offset((page - 1) * limit).limit(limit).all()
+    
+    return {"tracks": tracks, "total": total, "page": page, "total_pages": total_pages}
+
+@app.get("/api/albums")
+def get_albums(db: Session = Depends(get_db)):
+    # Corrección para que la barra lateral reciba correctamente el ID de la primera canción y muestre la foto
+    albums = db.query(Track.album, func.min(Track.id)).filter(Track.album != None).group_by(Track.album).all()
+    return [{"name": a[0], "id": a[1]} for a in albums if a[0]]
+
+@app.get("/api/artists")
+def get_artists(db: Session = Depends(get_db)):
+    return [a[0] for a in db.query(Track.artist).distinct().all()]
 
 @app.get("/api/stream/{track_id}")
-def stream_track(track_id: int):
-    db = SessionLocal()
+def stream_track(track_id: int, db: Session = Depends(get_db)):
     track = db.query(Track).filter(Track.id == track_id).first()
-    db.close()
-    if not track or not os.path.exists(track.path):
-        raise HTTPException(status_code=404, detail="Track not found")
+    if not track or not os.path.exists(track.path): raise HTTPException(404)
     return FileResponse(track.path, media_type="audio/flac")
 
 @app.get("/api/covers/{track_id}")
-def get_cover(track_id: int):
-    db = SessionLocal()
+def get_cover(track_id: int, db: Session = Depends(get_db)):
     track = db.query(Track).filter(Track.id == track_id).first()
-    db.close()
-    if not track or not os.path.exists(track.path):
-        raise HTTPException(status_code=404, detail="Track not found")
+    if not track or not os.path.exists(track.path): raise HTTPException(404)
     try:
         audio = FLAC(track.path)
-        if audio.pictures:
-            return Response(content=audio.pictures[0].data, media_type=audio.pictures[0].mime)
-        raise HTTPException(status_code=404)
-    except Exception:
-        raise HTTPException(status_code=404)
+        if audio.pictures: return Response(content=audio.pictures[0].data, media_type=audio.pictures[0].mime)
+        raise HTTPException(404)
+    except:
+        raise HTTPException(404)
