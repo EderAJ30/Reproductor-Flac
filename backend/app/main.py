@@ -4,35 +4,49 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import threading, os
 from mutagen.flac import FLAC
+from pydantic import BaseModel
 
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, func
 from .database import engine, Base, get_db
 from .models import Track
-from .scanner import scan_directory, MUSIC_DIR
+from .scanner import scan_directory, monitor_usb, Config
 
 Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    threading.Thread(target=scan_directory).start()
+    threading.Thread(target=monitor_usb, daemon=True).start()
+    threading.Thread(target=scan_directory, daemon=True).start()
     yield
 
 app = FastAPI(title="FLAC Player API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+class PathUpdate(BaseModel):
+    path: str
+
+@app.post("/api/settings/path")
+def update_path(data: PathUpdate, background_tasks: BackgroundTasks):
+    Config.MUSIC_DIR = data.path
+    Config.last_status = False
+    # Escanear desde 0 al guardar nueva ruta
+    background_tasks.add_task(scan_directory, force_clear=True)
+    return {"status": "ok", "path": Config.MUSIC_DIR}
+
 @app.post("/api/scan")
 def trigger_scan(background_tasks: BackgroundTasks):
-    background_tasks.add_task(scan_directory)
+    # El botón "Sincronizar" ahora limpia duplicados y empieza de 0
+    background_tasks.add_task(scan_directory, force_clear=True)
     return {"status": "ok"}
   
 @app.get("/api/status")
 def get_device_status():
     try:
-        is_mounted = os.path.exists(MUSIC_DIR) and len(os.listdir(MUSIC_DIR)) > 0
-        return {"connected": is_mounted, "path": MUSIC_DIR}
+        is_mounted = os.path.exists(Config.MUSIC_DIR) and len(os.listdir(Config.MUSIC_DIR)) > 0
+        return {"connected": is_mounted, "path": Config.MUSIC_DIR}
     except Exception:
-        return {"connected": False, "path": MUSIC_DIR}
+        return {"connected": False, "path": Config.MUSIC_DIR}
 
 @app.get("/api/info")
 def get_library_info(db: Session = Depends(get_db)):
@@ -90,3 +104,16 @@ def get_cover(track_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404)
     except:
         raise HTTPException(404)
+      
+@app.get("/api/directories")
+def list_directories(path: str = "/Volumes"):
+    try:
+        # Asegurar que la ruta exista
+        if not os.path.exists(path) or not os.path.isdir(path):
+            return {"directories": [], "current_path": path}
+        
+        # Listar solo carpetas (ignorando archivos ocultos)
+        dirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)) and not d.startswith('.')]
+        return {"directories": sorted(dirs), "current_path": path}
+    except Exception as e:
+        return {"directories": [], "current_path": path, "error": str(e)}

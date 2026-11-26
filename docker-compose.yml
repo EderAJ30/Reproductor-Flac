@@ -1,33 +1,23 @@
+version: "3.8"
+
 services:
   api:
     build: ./backend
     container_name: flac_backend
-    restart: unless-stopped
     ports:
-      - "8000:8000" # Exponemos el backend directamente para probarlo
+      - "8000:8000"
     volumes:
-      - ${MUSIC_PATH}:/music:ro
-      - ./volumes/db:/app/db # Restablecemos el guardado de la base de datos
-    networks:
-      - internal_net
-    environment:
-      - MUSIC_DIR=/music
-      - DATABASE_URL=sqlite:////app/db/flac_metadata.db
-
-  proxy:
-    image: nginx:alpine
-    container_name: flac_nginx
+      - ./backend/app:/app/app
+      - ./volumes/db:/app/db
+      - /Volumes:/Volumes:ro # <--- MAGIA: Lee cualquier USB sin romperse si lo desconectas
     restart: unless-stopped
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ${MUSIC_PATH}:/music:ro # Nginx lee directo del Shanling/SD
-    networks:
-      - internal_net
-    depends_on:
-      - api
 
-networks:
-  internal_net:
-    driver: bridge
+  frontend:
+    build: ./frontend
+    container_name: flac_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    restart: unless-stopped

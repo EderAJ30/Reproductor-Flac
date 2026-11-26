@@ -258,7 +258,7 @@ const formatDuration = (seconds) => {
                 <p
                   :class="
                     playerStore.currentTrack?.id === track.id
-                      ? 'text-green-500'
+                      ? 'text-purple-500'
                       : 'text-white'
                   "
                   class="font-semibold truncate text-base"
